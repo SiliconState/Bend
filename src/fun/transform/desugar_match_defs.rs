@@ -56,23 +56,24 @@ impl Definition {
     errs.extend(repeated_bind_errs);
 
     let args = (0..self.arity()).map(|i| Name::new(format!("%arg{i}"))).collect::<Vec<_>>();
+    let original_pats = self.rules.iter().map(|rule| rule.pats.clone()).collect::<Vec<_>>();
     let rules = std::mem::take(&mut self.rules);
     let idx = (0..rules.len()).collect::<Vec<_>>();
     let mut used = BTreeSet::new();
-    match simplify_rule_match(args.clone(), rules.clone(), idx.clone(), vec![], &mut used, ctrs, adts) {
+    match simplify_rule_match(args.clone(), rules, idx.clone(), vec![], &mut used, ctrs, adts) {
       Ok(body) => {
         let body = Term::rfold_lams(body, args.into_iter().map(Some));
-        self.rules = vec![Rule { pats: vec![], body }];
         for i in idx {
           if !used.contains(&i) {
             let e = DesugarMatchDefErr::UnreachableRule {
               idx: i,
               nam: self.name.clone(),
-              pats: rules[i].pats.clone(),
+              pats: original_pats[i].clone(),
             };
             errs.push(e);
           }
         }
+        self.rules = vec![Rule { pats: vec![], body }];
       }
       Err(e) => errs.push(e),
     }
@@ -343,7 +344,7 @@ fn num_rule(
       match &rule.pats[0] {
         Pattern::Num(n) if n == num => {
           let body = rule.body.clone();
-          let rule = Rule { pats: rule.pats[1..].to_vec(), body };
+          let rule = Rule { pats: rule.pats.iter().skip(1).cloned().collect(), body };
           new_rules.push(rule);
           new_idx.push(idx);
         }
@@ -356,7 +357,7 @@ fn num_rule(
               nxt: Box::new(std::mem::take(&mut body)),
             };
           }
-          let rule = Rule { pats: rule.pats[1..].to_vec(), body };
+          let rule = Rule { pats: rule.pats.iter().skip(1).cloned().collect(), body };
           new_rules.push(rule);
           new_idx.push(idx);
         }
@@ -380,7 +381,7 @@ fn num_rule(
         body = Term::Use { nam: Some(var.clone()), val: Box::new(var_recovered), nxt: Box::new(body) };
         fast_pred_access(&mut body, cur_num, var, &pred_var);
       }
-      let rule = Rule { pats: rule.pats[1..].to_vec(), body };
+      let rule = Rule { pats: rule.pats.into_iter().skip(1).collect(), body };
       new_rules.push(rule);
       new_idx.push(idx);
     }
@@ -502,20 +503,22 @@ fn switch_rule(
 
   let mut new_arms = vec![];
   for (ctr_nam, ctr) in &adts[&adt_name].ctrs {
-    let new_args = ctr.fields.iter().map(|f| Name::new(format!("{}.{}", arg, f.nam)));
-    let args = new_args.clone().chain(old_args.clone()).collect();
+    // REF-03 (`workspace/notes/isomorphic-optimization-reference.md`): keep
+    // constructor field names in a small reusable row vector for this arm so we
+    // don't repeatedly clone lazy iterators and row tails while specializing.
+    let new_args = ctr.fields.iter().map(|f| Name::new(format!("{}.{}", arg, f.nam))).collect::<Vec<_>>();
+    let args = new_args.iter().cloned().chain(old_args.iter().cloned()).collect();
 
     let mut new_rules = vec![];
     let mut new_idx = vec![];
     for (rule, &idx) in rules.iter().zip(&idx) {
-      let old_pats = rule.pats[1..].to_vec();
       match &rule.pats[0] {
         // Same ctr, extract subpatterns.
         // (Ctr pat0_0 ... pat0_m) pat1 ... patN: body
         // becomes
         // pat0_0 ... pat0_m pat1 ... patN: body
         Pattern::Ctr(found_ctr, new_pats) if ctr_nam == found_ctr => {
-          let pats = new_pats.iter().cloned().chain(old_pats).collect();
+          let pats = new_pats.iter().cloned().chain(rule.pats.iter().skip(1).cloned()).collect();
           let body = rule.body.clone();
           let rule = Rule { pats, body };
           new_rules.push(rule);
@@ -527,12 +530,18 @@ fn switch_rule(
         // arg0.field0 ... arg0.fieldM pat1 ... patN:
         //   use var = (Ctr arg0.field0 ... arg0.fieldM); body
         Pattern::Var(var) => {
-          let new_pats = new_args.clone().map(|n| Pattern::Var(Some(n)));
-          let pats = new_pats.chain(old_pats.clone()).collect();
+          let pats = new_args
+            .iter()
+            .cloned()
+            .map(|n| Pattern::Var(Some(n)))
+            .chain(rule.pats.iter().skip(1).cloned())
+            .collect();
           let mut body = rule.body.clone();
-          let reconstructed_var =
-            Term::call(Term::Ref { nam: ctr_nam.clone() }, new_args.clone().map(|nam| Term::Var { nam }));
           if let Some(var) = var {
+            let reconstructed_var = Term::call(
+              Term::Ref { nam: ctr_nam.clone() },
+              new_args.iter().cloned().map(|nam| Term::Var { nam }),
+            );
             body =
               Term::Use { nam: Some(var.clone()), val: Box::new(reconstructed_var), nxt: Box::new(body) };
           }
@@ -549,7 +558,7 @@ fn switch_rule(
     }
 
     let body = simplify_rule_match(args, new_rules, new_idx, with.clone(), used, ctrs, adts)?;
-    new_arms.push((Some(ctr_nam.clone()), new_args.map(Some).collect(), body));
+    new_arms.push((Some(ctr_nam.clone()), new_args.into_iter().map(Some).collect(), body));
   }
 
   // Linearize previously matched vars and current args.

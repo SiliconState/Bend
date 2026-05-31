@@ -10,12 +10,23 @@ pub fn add_recursive_priority(book: &mut Book) {
   let cycles = cycles(&deps);
 
   for cycle in cycles {
-    // For each function in the cycle, if there are redexes with the
-    // next ref in the cycle, add a priority to one of those redexes.
-    for i in 0..cycle.len() {
-      let cur = book.defs.get_mut(&cycle[i]).unwrap();
-      let nxt = &cycle[(i + 1) % cycle.len()];
-      add_priority_next_in_cycle(cur, nxt);
+    // For each function in a recursive component, if there are repeated
+    // redexes pointing to another function in that component, add priority.
+    // REF-05 returns SCCs rather than one arbitrary simple cycle, so branching
+    // recursive components still get all intra-component recursive edges.
+    let in_cycle = cycle.iter().cloned().collect::<HashSet<_>>();
+    for cur_name in &cycle {
+      let nexts = deps
+        .get(cur_name)
+        .into_iter()
+        .flat_map(|deps| deps.iter())
+        .filter(|nxt| in_cycle.contains(*nxt))
+        .cloned()
+        .collect::<Vec<_>>();
+      let cur = book.defs.get_mut(cur_name).unwrap();
+      for nxt in nexts {
+        add_priority_next_in_cycle(cur, &nxt);
+      }
     }
   }
 }
@@ -57,47 +68,96 @@ fn add_priority_next_in_cycle(net: &mut Net, nxt: &String) {
 type DepGraph = HashMap<String, HashSet<String>>;
 type Cycles = Vec<Vec<String>>;
 
-/// Find all cycles in the dependency graph.
+/// Find all recursive strongly connected components in the dependency graph.
 pub fn cycles(deps: &DepGraph) -> Cycles {
-  let mut cycles = vec![];
-  let mut stack = vec![];
-  let mut visited = HashSet::new();
-  for nam in deps.keys() {
-    if !visited.contains(nam) {
-      find_cycles(deps, nam, &mut visited, &mut stack, &mut cycles);
-    }
-  }
-  cycles
+  // REF-05 (`workspace/notes/isomorphic-optimization-reference.md`): Tarjan
+  // SCC with an explicit `on_stack` set replaces linear stack scans.
+  let tarjan = Tarjan::new(deps);
+  tarjan.cycles()
 }
 
-fn find_cycles(
-  deps: &DepGraph,
-  nam: &String,
-  visited: &mut HashSet<String>,
-  stack: &mut Vec<String>,
-  cycles: &mut Cycles,
-) {
-  maybe_grow(|| {
-    // Check if the current ref is already in the stack, which indicates a cycle.
-    if let Some(cycle_start) = stack.iter().position(|n| n == nam) {
-      // If found, add the cycle to the cycles vector.
-      cycles.push(stack[cycle_start..].to_vec());
-      return;
+struct Tarjan<'a> {
+  deps: &'a DepGraph,
+  index: usize,
+  indices: HashMap<&'a String, usize>,
+  lowlink: HashMap<&'a String, usize>,
+  stack: Vec<&'a String>,
+  on_stack: HashSet<&'a String>,
+  cycles: Cycles,
+}
+
+impl<'a> Tarjan<'a> {
+  fn new(deps: &'a DepGraph) -> Self {
+    Self {
+      deps,
+      index: 0,
+      indices: HashMap::new(),
+      lowlink: HashMap::new(),
+      stack: Vec::new(),
+      on_stack: HashSet::new(),
+      cycles: Vec::new(),
     }
-    // If the ref has not been visited yet, mark it as visited.
-    if visited.insert(nam.clone()) {
-      // Add the current ref to the stack to keep track of the path.
-      stack.push(nam.clone());
-      // Get the dependencies of the current ref.
-      if let Some(dependencies) = deps.get(nam) {
-        // Search for cycles from each dependency.
+  }
+
+  fn cycles(mut self) -> Cycles {
+    let mut names = self.deps.keys().collect::<Vec<_>>();
+    names.sort();
+    for nam in names {
+      if !self.indices.contains_key(nam) {
+        self.strong_connect(nam);
+      }
+    }
+    self.cycles.sort();
+    self.cycles
+  }
+
+  fn strong_connect(&mut self, nam: &'a String) {
+    maybe_grow(|| {
+      self.indices.insert(nam, self.index);
+      self.lowlink.insert(nam, self.index);
+      self.index += 1;
+      self.stack.push(nam);
+      self.on_stack.insert(nam);
+
+      if let Some(dependencies) = self.deps.get(nam) {
+        let mut dependencies = dependencies.iter().collect::<Vec<_>>();
+        dependencies.sort();
         for dep in dependencies {
-          find_cycles(deps, dep, visited, stack, cycles);
+          if !self.indices.contains_key(dep) {
+            self.strong_connect(dep);
+            let low = self.lowlink[nam].min(self.lowlink[dep]);
+            self.lowlink.insert(nam, low);
+          } else if self.on_stack.contains(dep) {
+            let low = self.lowlink[nam].min(self.indices[dep]);
+            self.lowlink.insert(nam, low);
+          }
         }
       }
-      stack.pop();
-    }
-  })
+
+      if self.lowlink[nam] == self.indices[nam] {
+        let mut component = Vec::new();
+        while let Some(dep) = self.stack.pop() {
+          self.on_stack.remove(dep);
+          component.push(dep.clone());
+          if dep == nam {
+            break;
+          }
+        }
+        component.sort();
+        if component.len() > 1 {
+          self.cycles.push(component);
+        } else if let Some(node) = component.first() {
+          if self.has_self_edge(node) {
+            self.cycles.push(vec![node.clone()]);
+          }
+        }
+      }
+    })
+  }
+
+  fn has_self_edge(&self, node: &String) -> bool {
+    self.deps.get(node).is_some_and(|deps| deps.contains(node))
+  }
 }
 
 /// Gather the set of net that this net directly depends on (has a ref in the net).
@@ -118,5 +178,34 @@ fn dependencies_tree(tree: &Tree, deps: &mut HashSet<String>) {
     for subtree in tree_children(tree) {
       dependencies_tree(subtree, deps);
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn set(items: &[&str]) -> HashSet<String> {
+    items.iter().map(|item| (*item).to_string()).collect()
+  }
+
+  #[test]
+  fn cycles_returns_full_branching_scc() {
+    let deps = HashMap::from([
+      ("A".to_string(), set(&["B", "C"])),
+      ("B".to_string(), set(&["A"])),
+      ("C".to_string(), set(&["A"])),
+      ("D".to_string(), set(&["E"])),
+      ("E".to_string(), HashSet::new()),
+    ]);
+
+    assert_eq!(cycles(&deps), vec![vec!["A".to_string(), "B".to_string(), "C".to_string()]]);
+  }
+
+  #[test]
+  fn cycles_keeps_self_edges() {
+    let deps = HashMap::from([("A".to_string(), set(&["A"])), ("B".to_string(), HashSet::new())]);
+
+    assert_eq!(cycles(&deps), vec![vec!["A".to_string()]]);
   }
 }

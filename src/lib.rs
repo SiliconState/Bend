@@ -12,6 +12,13 @@ use crate::{
 };
 use diagnostics::{Diagnostics, DiagnosticsConfig, ERR_INDENT_SIZE};
 use net::hvm_to_net::hvm_to_net;
+use std::{
+  fs::{self, OpenOptions},
+  io::Write,
+  path::PathBuf,
+  sync::atomic::{AtomicU64, Ordering},
+  time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 pub mod diagnostics;
 // `Name` triggers this warning, but it's safe because we're not using its internal mutability.
@@ -220,11 +227,13 @@ pub fn readback_hvm_net(
 
 /// Runs an HVM book by invoking HVM as a subprocess.
 fn run_hvm(book: &::hvm::ast::Book, cmd: &str, run_opts: &RunOpts) -> Result<String, String> {
-  let out_path = ".out.hvm";
-  std::fs::write(out_path, hvm_book_show_pretty(book)).map_err(|x| x.to_string())?;
+  // REF-06 (`workspace/notes/isomorphic-optimization-reference.md`): use a
+  // unique temp HVM file instead of `.out.hvm`, preserving the exact HVM text
+  // while making concurrent Bend invocations from one cwd safe.
+  let hvm_file = write_temp_hvm_book(book)?;
   let mut process = std::process::Command::new(run_opts.hvm_path.clone())
     .arg(cmd)
-    .arg(out_path)
+    .arg(hvm_file.path_buf())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::inherit())
     .spawn()
@@ -234,9 +243,6 @@ fn run_hvm(book: &::hvm::ast::Book, cmd: &str, run_opts: &RunOpts) -> Result<Str
   let thread_out = std::thread::spawn(move || filter_hvm_output(child_out, std::io::stdout()));
 
   let _ = process.wait().expect("Failed to wait on hvm subprocess");
-  if let Err(e) = std::fs::remove_file(out_path) {
-    eprintln!("Error removing HVM output file. {e}");
-  }
 
   let result = thread_out.join().map_err(|_| "HVM output thread panicked.".to_string())??;
   Ok(result)
@@ -463,6 +469,61 @@ impl std::fmt::Display for AdtEncoding {
   }
 }
 
+static TEMP_HVM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub struct TempHvmFile {
+  path: PathBuf,
+}
+
+impl TempHvmFile {
+  pub fn path_buf(&self) -> &std::path::Path {
+    &self.path
+  }
+}
+
+impl Drop for TempHvmFile {
+  fn drop(&mut self) {
+    if let Err(e) = fs::remove_file(&self.path) {
+      if e.kind() != std::io::ErrorKind::NotFound {
+        eprintln!("Error removing HVM output file. {e}");
+      }
+    }
+  }
+}
+
+pub fn write_temp_hvm_book(book: &::hvm::ast::Book) -> Result<TempHvmFile, String> {
+  write_temp_hvm_text(&hvm_book_show_pretty(book))
+}
+
+fn write_temp_hvm_text(contents: &str) -> Result<TempHvmFile, String> {
+  for _ in 0..128 {
+    let path = next_temp_hvm_path();
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+      Ok(mut file) => {
+        let write_result = file.write_all(contents.as_bytes()).and_then(|_| file.flush());
+        drop(file);
+        if let Err(e) = write_result {
+          let _ = fs::remove_file(&path);
+          return Err(e.to_string());
+        }
+        return Ok(TempHvmFile { path });
+      }
+      Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+      Err(e) => return Err(e.to_string()),
+    }
+  }
+  Err("failed to create a unique temporary HVM file".to_string())
+}
+
+fn next_temp_hvm_path() -> PathBuf {
+  let mut path = std::env::temp_dir();
+  let stamp =
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_secs(0)).as_nanos();
+  let count = TEMP_HVM_COUNTER.fetch_add(1, Ordering::Relaxed);
+  path.push(format!("bend-{}-{stamp}-{count}.hvm", std::process::id()));
+  path
+}
+
 pub struct CompileResult {
   pub diagnostics: Diagnostics,
   pub hvm_book: ::hvm::ast::Book,
@@ -474,4 +535,72 @@ where
   F: FnOnce() -> R,
 {
   stacker::maybe_grow(1024 * 32, 1024 * 1024, f)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{diagnostics::Severity, imports::DefaultLoader};
+  use std::path::Path;
+
+  #[test]
+  fn temp_hvm_files_are_unique_and_removed_on_drop() {
+    let first = write_temp_hvm_text("@main = 0\n").unwrap();
+    let second = write_temp_hvm_text("@main = 1\n").unwrap();
+    let first_path = first.path_buf().to_path_buf();
+    let second_path = second.path_buf().to_path_buf();
+
+    assert_ne!(first_path, second_path);
+    assert!(first_path.exists());
+    assert!(second_path.exists());
+    assert_eq!(fs::read_to_string(&first_path).unwrap(), "@main = 0\n");
+    assert_eq!(fs::read_to_string(&second_path).unwrap(), "@main = 1\n");
+
+    drop(first);
+    drop(second);
+
+    assert!(!first_path.exists());
+    assert!(!second_path.exists());
+  }
+
+  fn check_source(source: &str) -> Result<Book, Diagnostics> {
+    let origin = Path::new("test.bend");
+    let mut book = load_to_book(
+      origin,
+      source,
+      DefaultLoader::new(origin),
+      DiagnosticsConfig::new(Severity::Error, true),
+    )?;
+    check_book(&mut book, DiagnosticsConfig::new(Severity::Error, true), CompileOpts::default())?;
+    Ok(book)
+  }
+
+  #[test]
+  fn type_check_restores_shadowed_let_bindings() {
+    check_source(
+      r#"
+def main(flag: u24) -> (u24, u24):
+  id = lambda x: x
+  y = id(1)
+  if flag == 0:
+    z = y
+  else:
+    z = id(2)
+  return (id(3), z)
+"#,
+    )
+    .unwrap();
+  }
+
+  #[test]
+  fn type_check_generalizes_let_bound_values() {
+    check_source(
+      r#"
+def main() -> (u24, i24):
+  id = lambda x: x
+  return (id(1), id(+1))
+"#,
+    )
+    .unwrap();
+  }
 }

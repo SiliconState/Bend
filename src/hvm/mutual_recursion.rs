@@ -9,7 +9,6 @@ use indexmap::{IndexMap, IndexSet};
 use std::fmt::Debug;
 
 type Ref = String;
-type Stack<T> = Vec<T>;
 type RefSet = IndexSet<Ref>;
 
 #[derive(Default)]
@@ -58,48 +57,152 @@ fn show_cycles(mut cycles: Vec<Vec<Ref>>) -> String {
 
 impl Graph {
   pub fn cycles(&self) -> Vec<Vec<Ref>> {
-    let mut cycles = Vec::new();
-    let mut stack = Stack::new();
-    let mut visited = RefSet::new();
-
-    for r#ref in self.0.keys() {
-      if !visited.contains(r#ref) {
-        self.find_cycles(r#ref, &mut visited, &mut stack, &mut cycles);
-      }
-    }
-
+    // REF-05 (`workspace/notes/isomorphic-optimization-reference.md`): use
+    // Tarjan SCC state with O(1) `on_stack` membership instead of scanning the
+    // DFS stack for every back edge.
+    let tarjan = Tarjan::new(&self.0);
+    let mut cycles = tarjan
+      .cycles()
+      .into_iter()
+      .map(|cycle| self.representative_cycle(cycle))
+      .collect::<Vec<_>>();
+    cycles.sort_by_key(|cycle| (usize::from(cycle.len() == 1), self.first_index(cycle)));
     cycles
   }
 
-  fn find_cycles(
-    &self,
-    r#ref: &Ref,
-    visited: &mut RefSet,
-    stack: &mut Stack<Ref>,
-    cycles: &mut Vec<Vec<Ref>>,
-  ) {
-    // Check if the current ref is already in the stack, which indicates a cycle.
-    if let Some(cycle_start) = stack.iter().position(|n| n == r#ref) {
-      // If found, add the cycle to the cycles vector.
-      cycles.push(stack[cycle_start..].to_vec());
-      return;
+  fn representative_cycle(&self, component: Vec<Ref>) -> Vec<Ref> {
+    if component.len() <= 1 {
+      return component;
     }
 
-    // If the ref has not been visited yet, mark it as visited.
-    if visited.insert(r#ref.clone()) {
-      // Add the current ref to the stack to keep track of the path.
-      stack.push(r#ref.clone());
+    let in_component = component.iter().cloned().collect::<RefSet>();
+    let start = component
+      .iter()
+      .min_by_key(|r#ref| self.0.get_index_of(*r#ref).unwrap_or(usize::MAX))
+      .cloned()
+      .unwrap_or_else(|| component[0].clone());
+    let mut path = vec![start.clone()];
+    let mut on_path = RefSet::from([start.clone()]);
+    if self.find_cycle_to_start(&start, &start, &in_component, &mut on_path, &mut path) {
+      path
+    } else {
+      // Tarjan proved this is a recursive component, so this fallback should not
+      // be reached. If it is, keep the component visible rather than dropping a
+      // recursion diagnostic.
+      component
+    }
+  }
 
-      // Get the dependencies of the current ref.
-      if let Some(dependencies) = self.get(r#ref) {
-        // Search for cycles from each dependency.
+  fn find_cycle_to_start(
+    &self,
+    current: &Ref,
+    start: &Ref,
+    in_component: &RefSet,
+    on_path: &mut RefSet,
+    path: &mut Vec<Ref>,
+  ) -> bool {
+    maybe_grow(|| {
+      let Some(dependencies) = self.0.get(current) else {
+        return false;
+      };
+      for dep in dependencies.iter().filter(|dep| in_component.contains(*dep)) {
+        if dep == start && path.len() > 1 {
+          return true;
+        }
+        if on_path.insert(dep.clone()) {
+          path.push(dep.clone());
+          if self.find_cycle_to_start(dep, start, in_component, on_path, path) {
+            return true;
+          }
+          path.pop();
+          on_path.shift_remove(dep);
+        }
+      }
+      false
+    })
+  }
+
+  fn first_index(&self, cycle: &[Ref]) -> usize {
+    cycle.iter().filter_map(|r#ref| self.0.get_index_of(r#ref)).min().unwrap_or(usize::MAX)
+  }
+}
+
+struct Tarjan<'a> {
+  graph: &'a IndexMap<Ref, RefSet>,
+  index: usize,
+  indices: IndexMap<&'a Ref, usize>,
+  lowlink: IndexMap<&'a Ref, usize>,
+  stack: Vec<&'a Ref>,
+  on_stack: IndexSet<&'a Ref>,
+  cycles: Vec<Vec<Ref>>,
+}
+
+impl<'a> Tarjan<'a> {
+  fn new(graph: &'a IndexMap<Ref, RefSet>) -> Self {
+    Self {
+      graph,
+      index: 0,
+      indices: IndexMap::new(),
+      lowlink: IndexMap::new(),
+      stack: Vec::new(),
+      on_stack: IndexSet::new(),
+      cycles: Vec::new(),
+    }
+  }
+
+  fn cycles(mut self) -> Vec<Vec<Ref>> {
+    for r#ref in self.graph.keys() {
+      if !self.indices.contains_key(r#ref) {
+        self.strong_connect(r#ref);
+      }
+    }
+    self.cycles
+  }
+
+  fn strong_connect(&mut self, r#ref: &'a Ref) {
+    maybe_grow(|| {
+      self.indices.insert(r#ref, self.index);
+      self.lowlink.insert(r#ref, self.index);
+      self.index += 1;
+      self.stack.push(r#ref);
+      self.on_stack.insert(r#ref);
+
+      if let Some(dependencies) = self.graph.get(r#ref) {
         for dep in dependencies {
-          self.find_cycles(dep, visited, stack, cycles);
+          if !self.indices.contains_key(dep) {
+            self.strong_connect(dep);
+            let low = self.lowlink[r#ref].min(self.lowlink[dep]);
+            self.lowlink.insert(r#ref, low);
+          } else if self.on_stack.contains(dep) {
+            let low = self.lowlink[r#ref].min(self.indices[dep]);
+            self.lowlink.insert(r#ref, low);
+          }
         }
       }
 
-      stack.pop();
-    }
+      if self.lowlink[r#ref] == self.indices[r#ref] {
+        let mut component = Vec::new();
+        while let Some(dep) = self.stack.pop() {
+          self.on_stack.shift_remove(dep);
+          component.push(dep.clone());
+          if dep == r#ref {
+            break;
+          }
+        }
+        component.reverse();
+        if component.len() > 1 {
+          self.cycles.push(component);
+        } else if let Some(node) = component.first() {
+          if self.has_self_edge(node) {
+            self.cycles.push(vec![node.clone()]);
+          }
+        }
+      }
+    })
+  }
+
+  fn has_self_edge(&self, node: &Ref) -> bool {
+    self.graph.get(node).is_some_and(|deps| deps.contains(node))
   }
 }
 

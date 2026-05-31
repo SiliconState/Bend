@@ -2,7 +2,8 @@ use crate::{
   fun::{Book, Definition, Name, Pattern, Rule, Source, Term},
   maybe_grow, multi_iterator,
 };
-use std::collections::{BTreeMap, HashSet};
+use indexmap::{IndexMap, IndexSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const NAME_SEP: &str = "__C";
 
@@ -31,8 +32,12 @@ impl Book {
   /// See [`Term::size`] for the measurement of size.
   /// It should more or less correspond to the compiled inet size.
   pub fn float_combinators(&mut self, max_size: usize) {
-    let book = self.clone();
-    let mut ctx = FloatCombinatorsCtx::new(&book, max_size);
+    // REF-04 (`workspace/notes/isomorphic-optimization-reference.md`): compute
+    // immutable per-definition safety from the pre-mutation book instead of
+    // cloning the whole book for reference lookups during mutation.
+    let def_safety = precompute_def_safety(self);
+    let constructors = self.ctrs.keys().cloned().collect();
+    let mut ctx = FloatCombinatorsCtx::new(def_safety, constructors, max_size);
 
     for (def_name, def) in self.defs.iter_mut() {
       // Don't float combinators in the main entrypoint.
@@ -48,7 +53,7 @@ impl Book {
       let check = def.check;
       let body = &mut def.rule_mut().body;
       ctx.reset();
-      ctx.def_size = body.size();
+      ctx.def_size = body.float_facts().size;
       body.float_combinators(&mut ctx, def_name, source, check);
     }
 
@@ -56,31 +61,103 @@ impl Book {
   }
 }
 
-struct FloatCombinatorsCtx<'b> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SafetyState {
+  Visiting,
+  Safe,
+  Unsafe,
+}
+
+struct FloatCombinatorsCtx {
   pub combinators: BTreeMap<Name, (bool, Definition)>,
   pub name_gen: usize,
-  pub seen: HashSet<Name>,
-  pub book: &'b Book,
+  pub def_safety: BTreeMap<Name, bool>,
+  pub constructors: BTreeSet<Name>,
   pub max_size: usize,
   pub def_size: usize,
 }
 
-impl<'b> FloatCombinatorsCtx<'b> {
-  fn new(book: &'b Book, max_size: usize) -> Self {
-    Self {
-      combinators: Default::default(),
-      name_gen: 0,
-      seen: Default::default(),
-      book,
-      max_size,
-      def_size: 0,
-    }
+impl FloatCombinatorsCtx {
+  fn new(def_safety: BTreeMap<Name, bool>, constructors: BTreeSet<Name>, max_size: usize) -> Self {
+    Self { combinators: Default::default(), name_gen: 0, def_safety, constructors, max_size, def_size: 0 }
   }
 
   fn reset(&mut self) {
     self.def_size = 0;
     self.name_gen = 0;
-    self.seen = Default::default();
+  }
+}
+
+#[derive(Default)]
+struct TermFacts {
+  size: usize,
+  free_vars: IndexMap<Name, u64>,
+  unscoped_declared: IndexSet<Name>,
+  unscoped_used: IndexSet<Name>,
+}
+
+impl TermFacts {
+  fn is_combinator(&self, term: &Term) -> bool {
+    self.free_vars.is_empty() && !self.has_unscoped_diff() && !matches!(term, Term::Ref { .. })
+  }
+
+  fn has_unscoped_diff(&self) -> bool {
+    self.unscoped_declared.difference(&self.unscoped_used).next().is_some()
+      || self.unscoped_used.difference(&self.unscoped_declared).next().is_some()
+  }
+}
+
+fn precompute_def_safety(book: &Book) -> BTreeMap<Name, bool> {
+  let mut memo = BTreeMap::new();
+  for name in book.defs.keys() {
+    let _ = original_def_is_safe(name, book, &mut memo);
+  }
+  memo.into_iter().map(|(name, state)| (name, matches!(state, SafetyState::Safe))).collect()
+}
+
+fn original_def_is_safe(name: &Name, book: &Book, memo: &mut BTreeMap<Name, SafetyState>) -> bool {
+  match memo.get(name).copied() {
+    Some(SafetyState::Safe) => return true,
+    Some(SafetyState::Unsafe | SafetyState::Visiting) => return false,
+    None => {}
+  }
+
+  memo.insert(name.clone(), SafetyState::Visiting);
+  let safe =
+    book.defs.get(name).map(|def| original_term_is_safe(&def.rule().body, book, memo)).unwrap_or(false);
+  memo.insert(name.clone(), if safe { SafetyState::Safe } else { SafetyState::Unsafe });
+  safe
+}
+
+fn original_term_is_safe(term: &Term, book: &Book, memo: &mut BTreeMap<Name, SafetyState>) -> bool {
+  maybe_grow(|| match term {
+    Term::Num { .. }
+    | Term::Era
+    | Term::Err
+    | Term::Fan { .. }
+    | Term::App { .. }
+    | Term::Oper { .. }
+    | Term::Swt { .. } => term.children().all(|c| original_term_is_safe(c, book, memo)),
+    Term::Lam { .. } => original_lambda_is_safe(term, book, memo),
+    Term::Ref { nam } => book.ctrs.contains_key(nam) || original_def_is_safe(nam, book, memo),
+    // TODO: Variables can be safe depending on how they're used.
+    _ => false,
+  })
+}
+
+fn original_lambda_is_safe(term: &Term, book: &Book, memo: &mut BTreeMap<Name, SafetyState>) -> bool {
+  let mut current = term;
+  let mut scope = Vec::new();
+
+  while let Term::Lam { pat, bod, .. } = current {
+    scope.extend(pat.binds().filter_map(|x| x.as_ref()));
+    current = bod;
+  }
+
+  match current {
+    Term::Var { nam } if scope.contains(&nam) => true,
+    Term::Ref { .. } => true,
+    term => original_term_is_safe(term, book, memo),
   }
 }
 
@@ -98,17 +175,21 @@ impl Term {
         child.float_combinators(ctx, def_name, source.clone(), check);
       }
 
-      let mut size = self.size();
-      let is_combinator = self.is_combinator();
+      // REF-02: collect size/free-var/unscoped facts in one local pass rather
+      // than calling size(), free_vars(), and unscoped_vars() separately.
+      let facts = self.float_facts();
+      let mut size = facts.size;
+      let is_combinator = facts.is_combinator(self);
 
       // Float unsafe children and children that make the term too big.
       for child in self.float_children_mut() {
+        let child_facts = child.float_facts();
         let child_is_safe = child.is_safe(ctx);
-        let child_size = child.size();
+        let child_size = child_facts.size;
 
         let extract_for_size = if is_combinator { size > ctx.max_size } else { ctx.def_size > ctx.max_size };
 
-        if child.is_combinator() && child_size > 0 && (!child_is_safe || extract_for_size) {
+        if child_facts.is_combinator(child) && child_size > 0 && (!child_is_safe || extract_for_size) {
           ctx.def_size -= child_size;
           size -= child_size;
           child.float(ctx, def_name, source.clone(), check, child_is_safe);
@@ -158,27 +239,19 @@ impl Term {
       | Term::Swt { .. } => self.children().all(|c| c.is_safe(ctx)),
       Term::Lam { .. } => self.is_safe_lambda(ctx),
       Term::Ref { nam } => {
-        // Constructors are safe
-        if ctx.book.ctrs.contains_key(nam) {
+        // Constructors are safe.
+        if ctx.constructors.contains(nam) {
           return true;
         }
-        // If recursive, not safe
-        if ctx.seen.contains(nam) {
-          return false;
-        }
-        ctx.seen.insert(nam.clone());
-
-        // Check if the function it's referring to is safe
-        let safe = if let Some(def) = ctx.book.defs.get(nam) {
-          def.rule().body.is_safe(ctx)
+        // Original definitions use precomputed summaries; generated
+        // combinators are checked from the insertion map.
+        if let Some(safe) = ctx.def_safety.get(nam) {
+          *safe
         } else if let Some((safe, _)) = ctx.combinators.get(nam) {
           *safe
         } else {
           false
-        };
-
-        ctx.seen.remove(nam);
-        safe
+        }
       }
       // TODO: Variables can be safe depending on how they're used
       // For example, in a well-typed numop they're safe.
@@ -210,8 +283,48 @@ impl Term {
     declared.difference(&used).count() != 0 || used.difference(&declared).count() != 0
   }
 
-  fn is_combinator(&self) -> bool {
-    self.free_vars().is_empty() && !self.has_unscoped_diff() && !matches!(self, Term::Ref { .. })
+  fn float_facts(&self) -> TermFacts {
+    fn go_pattern(pat: &Pattern, declared: &mut IndexSet<Name>) {
+      maybe_grow(|| {
+        if let Pattern::Chn(name) = pat {
+          declared.insert(name.clone());
+        }
+        for child in pat.children() {
+          go_pattern(child, declared);
+        }
+      })
+    }
+
+    fn go(term: &Term) -> TermFacts {
+      maybe_grow(|| {
+        let mut facts = TermFacts { size: term.base_size(), ..Default::default() };
+
+        if let Term::Var { nam } = term {
+          *facts.free_vars.entry(nam.clone()).or_default() += 1;
+        }
+        if let Term::Link { nam } = term {
+          facts.unscoped_used.insert(nam.clone());
+        }
+        if let Some(pat) = term.pattern() {
+          go_pattern(pat, &mut facts.unscoped_declared);
+        }
+
+        for (child, binds) in term.children_with_binds() {
+          let mut child_facts = go(child);
+          facts.size += child_facts.size;
+          for nam in binds.flatten() {
+            child_facts.free_vars.shift_remove(nam);
+          }
+          facts.free_vars.extend(child_facts.free_vars);
+          facts.unscoped_declared.extend(child_facts.unscoped_declared);
+          facts.unscoped_used.extend(child_facts.unscoped_used);
+        }
+
+        facts
+      })
+    }
+
+    go(self)
   }
 
   fn base_size(&self) -> usize {
@@ -240,13 +353,6 @@ impl Term {
       | Term::Def { .. }
       | Term::Err => unreachable!(),
     }
-  }
-
-  fn size(&self) -> usize {
-    maybe_grow(|| {
-      let children_size: usize = self.children().map(|c| c.size()).sum();
-      self.base_size() + children_size
-    })
   }
 
   pub fn float_children_mut(&mut self) -> impl Iterator<Item = &mut Term> {
