@@ -134,6 +134,12 @@ struct CliRunOpts {
 
   #[arg(short = 's', long = "stats", help = "Shows runtime stats and rewrite counts")]
   print_stats: bool,
+
+  #[arg(
+    long = "profile-json",
+    help = "Emit the result and runtime stats as one JSON object on stdout (replaces the Result/stats lines)"
+  )]
+  profile_json: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -295,6 +301,13 @@ fn execute_cli_mode(mut cli: Cli) -> Result<(), Diagnostics> {
     _ => "run-c",
   };
 
+  // Bend-side backend label for --profile-json (hvm calls run-rs just "run").
+  let backend_label = match &cli.mode {
+    Mode::RunRs(..) => "run-rs",
+    Mode::RunCu(..) => "run-cu",
+    _ => "run-c",
+  };
+
   let compiler_target = match &cli.mode {
     Mode::RunC(..) => CompilerTarget::C,
     Mode::GenC(..) => CompilerTarget::C,
@@ -327,7 +340,7 @@ fn execute_cli_mode(mut cli: Cli) -> Result<(), Diagnostics> {
     Mode::RunC(RunArgs { pretty, run_opts, comp_opts, warn_opts, path, arguments })
     | Mode::RunCu(RunArgs { pretty, run_opts, comp_opts, warn_opts, path, arguments })
     | Mode::RunRs(RunArgs { pretty, run_opts, comp_opts, warn_opts, path, arguments }) => {
-      let CliRunOpts { linear, print_stats } = run_opts;
+      let CliRunOpts { linear, print_stats, profile_json } = run_opts;
 
       let diagnostics_cfg =
         set_warning_cfg_from_cli(DiagnosticsConfig::new(Severity::Allow, arg_verbose), warn_opts);
@@ -343,13 +356,19 @@ fn execute_cli_mode(mut cli: Cli) -> Result<(), Diagnostics> {
         run_book(book, run_opts, compile_opts, diagnostics_cfg, arguments, run_cmd)?
       {
         eprint!("{diags}");
-        if pretty {
-          println!("Result:\n{}", term.display_pretty(0));
+        if profile_json {
+          // Machine-readable run output: any user prints stream before it, so
+          // tools take the last stdout line. Replaces the Result/stats lines.
+          println!("{}", profile_json_line(backend_label, &term.to_string(), &stats));
         } else {
-          println!("Result: {}", term);
-        }
-        if print_stats {
-          println!("{stats}");
+          if pretty {
+            println!("Result:\n{}", term.display_pretty(0));
+          } else {
+            println!("Result: {}", term);
+          }
+          if print_stats {
+            println!("{stats}");
+          }
         }
       }
     }
@@ -446,4 +465,122 @@ fn set_warning_cfg_from_cli(mut cfg: DiagnosticsConfig, warn_opts: CliWarnOpts) 
     }
   }
   cfg
+}
+
+/// One compact JSON object for `--profile-json`: the readback result plus the
+/// HVM stats lines (`- KEY: value`) parsed into typed fields, so tools stop
+/// scraping `-s` text. Unknown stats keys pass through, keeping the output
+/// forward-compatible with new runtime stats.
+fn profile_json_line(backend: &str, result: &str, stats: &str) -> String {
+  let mut fields = Vec::new();
+  for raw in stats.lines() {
+    let line = raw.trim();
+    let line = line.strip_prefix("- ").unwrap_or(line);
+    let Some((key, value)) = line.split_once(':') else { continue };
+    let key = key.trim();
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+      continue;
+    }
+    let value = value.trim();
+    let (name, value) = match key.to_ascii_uppercase().as_str() {
+      // TIME prints with a trailing unit ("0.06s"); strip it and name the unit.
+      "TIME" => ("time_s".to_string(), value.trim_end_matches('s').trim()),
+      other => (other.to_ascii_lowercase(), value),
+    };
+    let json_value = if is_json_number(value) {
+      value.to_string()
+    } else {
+      format!("\"{}\"", json_escape(value))
+    };
+    fields.push(format!("\"{}\": {}", json_escape(&name), json_value));
+  }
+  format!(
+    "{{\"backend\": \"{}\", \"result\": \"{}\", \"stats\": {{{}}}}}",
+    json_escape(backend),
+    json_escape(result),
+    fields.join(", ")
+  )
+}
+
+/// Strict JSON number grammar. Rust's float parser also accepts `inf`, `NaN`,
+/// `+5` and `.5`, none of which are valid JSON; those must be quoted instead.
+fn is_json_number(value: &str) -> bool {
+  let mut chars = value.chars().peekable();
+  if chars.peek() == Some(&'-') {
+    chars.next();
+  }
+  // Integer part: 0, or a nonzero digit followed by digits.
+  match chars.next() {
+    Some('0') => {}
+    Some(c) if c.is_ascii_digit() => while chars.next_if(|c| c.is_ascii_digit()).is_some() {},
+    _ => return false,
+  }
+  if chars.next_if(|c| *c == '.').is_some() {
+    if chars.next_if(|c| c.is_ascii_digit()).is_none() {
+      return false;
+    }
+    while chars.next_if(|c| c.is_ascii_digit()).is_some() {}
+  }
+  if chars.next_if(|c| *c == 'e' || *c == 'E').is_some() {
+    chars.next_if(|c| *c == '+' || *c == '-');
+    if chars.next_if(|c| c.is_ascii_digit()).is_none() {
+      return false;
+    }
+    while chars.next_if(|c| c.is_ascii_digit()).is_some() {}
+  }
+  chars.next().is_none()
+}
+
+fn json_escape(value: &str) -> String {
+  let mut out = String::with_capacity(value.len());
+  for ch in value.chars() {
+    match ch {
+      '"' => out.push_str("\\\""),
+      '\\' => out.push_str("\\\\"),
+      '\n' => out.push_str("\\n"),
+      '\r' => out.push_str("\\r"),
+      '\t' => out.push_str("\\t"),
+      c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+      c => out.push(c),
+    }
+  }
+  out
+}
+
+#[cfg(test)]
+mod profile_json_tests {
+  use super::*;
+
+  #[test]
+  fn parses_hvm_stats_into_typed_json() {
+    let stats = "- ITRS: 5767113\n- TIME: 0.06s\n- MIPS: 98.01\n- THREADS: 4\n";
+    let line = profile_json_line("run-c", "16744448", stats);
+    assert_eq!(
+      line,
+      "{\"backend\": \"run-c\", \"result\": \"16744448\", \"stats\": {\"itrs\": 5767113, \"time_s\": 0.06, \"mips\": 98.01, \"threads\": 4}}"
+    );
+  }
+
+  #[test]
+  fn quotes_values_that_rust_parses_as_floats_but_json_rejects() {
+    // `(double)itrs / 0.0` prints "inf"; Rust would happily parse it back as
+    // f64, but bare inf/NaN/+5/.5 are invalid JSON and must be quoted.
+    let stats = "- MIPS: inf\n- A: NaN\n- B: +5\n- C: .5\n- D: 5.\n- E: 1e3\n- F: -0.5\n";
+    let line = profile_json_line("run-c", "1", stats);
+    assert!(line.contains("\"mips\": \"inf\""));
+    assert!(line.contains("\"a\": \"NaN\""));
+    assert!(line.contains("\"b\": \"+5\""));
+    assert!(line.contains("\"c\": \".5\""));
+    assert!(line.contains("\"d\": \"5.\""));
+    assert!(line.contains("\"e\": 1e3"));
+    assert!(line.contains("\"f\": -0.5"));
+  }
+
+  #[test]
+  fn escapes_result_strings_and_skips_non_stat_lines() {
+    let line = profile_json_line("run", "\"a\\b\"", "not a stat line\n- LEAK: 42\n");
+    assert!(line.contains("\"result\": \"\\\"a\\\\b\\\"\""));
+    assert!(line.contains("\"leak\": 42"));
+    assert!(!line.contains("not a stat"));
+  }
 }
