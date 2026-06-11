@@ -222,9 +222,12 @@ pub fn readback_hvm_net(
 fn run_hvm(book: &::hvm::ast::Book, cmd: &str, run_opts: &RunOpts) -> Result<String, String> {
   let out_path = ".out.hvm";
   std::fs::write(out_path, hvm_book_show_pretty(book)).map_err(|x| x.to_string())?;
-  let mut process = std::process::Command::new(run_opts.hvm_path.clone())
-    .arg(cmd)
-    .arg(out_path)
+  let mut command = std::process::Command::new(run_opts.hvm_path.clone());
+  command.arg(cmd).arg(out_path);
+  if let Some(threads) = run_opts.threads {
+    command.env("HVM_THREADS", threads.to_string());
+  }
+  let mut process = command
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::inherit())
     .spawn()
@@ -314,11 +317,14 @@ pub struct RunOpts {
   pub linear_readback: bool,
   pub pretty: bool,
   pub hvm_path: String,
+  /// Worker thread count for the parallel backends (run-c/run-cu), exported as
+  /// `HVM_THREADS` on the spawned `hvm` process. `None` keeps HVM's compiled TPC.
+  pub threads: Option<usize>,
 }
 
 impl Default for RunOpts {
   fn default() -> Self {
-    RunOpts { linear_readback: false, pretty: false, hvm_path: "hvm".to_string() }
+    RunOpts { linear_readback: false, pretty: false, hvm_path: "hvm".to_string(), threads: None }
   }
 }
 

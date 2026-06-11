@@ -134,6 +134,12 @@ struct CliRunOpts {
 
   #[arg(short = 's', long = "stats", help = "Shows runtime stats and rewrite counts")]
   print_stats: bool,
+
+  #[arg(
+    long = "threads",
+    help = "Worker thread count: sets HVM_THREADS on the spawned hvm (read by the C runtime; other runtimes ignore it)"
+  )]
+  threads: Option<usize>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -327,7 +333,7 @@ fn execute_cli_mode(mut cli: Cli) -> Result<(), Diagnostics> {
     Mode::RunC(RunArgs { pretty, run_opts, comp_opts, warn_opts, path, arguments })
     | Mode::RunCu(RunArgs { pretty, run_opts, comp_opts, warn_opts, path, arguments })
     | Mode::RunRs(RunArgs { pretty, run_opts, comp_opts, warn_opts, path, arguments }) => {
-      let CliRunOpts { linear, print_stats } = run_opts;
+      let CliRunOpts { linear, print_stats, threads } = run_opts;
 
       let diagnostics_cfg =
         set_warning_cfg_from_cli(DiagnosticsConfig::new(Severity::Allow, arg_verbose), warn_opts);
@@ -336,7 +342,7 @@ fn execute_cli_mode(mut cli: Cli) -> Result<(), Diagnostics> {
 
       compile_opts.check_for_strict();
 
-      let run_opts = RunOpts { linear_readback: linear, pretty, hvm_path: hvm_bin };
+      let run_opts = RunOpts { linear_readback: linear, pretty, hvm_path: hvm_bin, threads };
 
       let book = load_book(&path, diagnostics_cfg)?;
       if let Some((term, stats, diags)) =
